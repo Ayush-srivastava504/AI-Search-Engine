@@ -1,7 +1,4 @@
-from app.indexing.elasticsearch_handler import ElasticsearchHandler
-from app.indexing.vector_store import VectorStore
 from app.search.query_parser import QueryParser
-from app.search.ranker import RankingStrategy
 from app.search.snippet_generator import SnippetGenerator
 from app.models.article import SearchResult, Article
 from app.crawlers.crawler_manager import CrawlerManager
@@ -12,20 +9,21 @@ from datetime import datetime
 
 class SearchService:
     def __init__(self):
-        self.es_handler = ElasticsearchHandler()
-        self.vector_store = VectorStore()
         self.query_parser = QueryParser()
-        self.ranker = RankingStrategy()
         self.snippet_gen = SnippetGenerator()
         self.crawler = CrawlerManager()
-        self.bm25_index = None
+        self.documents = {}
+        self.bm25 = None
+        self.doc_list = []
 
     def index_articles(self, articles: list[Article]):
-        embeddings = self.vector_store.embed_batch(
-            [f"{article.title} {article.excerpt}" for article in articles]
-        )
+        self.documents = {article.id: article for article in articles}
+        self.doc_list = articles
         
-        self.es_handler.bulk_index(articles, embeddings)
+        contents = [f"{article.title} {article.content} {' '.join(article.tags)}" for article in articles]
+        tokenized = [content.lower().split() for content in contents]
+        
+        self.bm25 = BM25Okapi(tokenized)
         print(f"Indexed {len(articles)} articles")
 
     def hybrid_search(self, query: str, top_k: int = 10, sort_by: str = "relevance") -> dict:
@@ -44,46 +42,57 @@ class SearchService:
         if parsed_query["to_date"]:
             filters["to_date"] = parsed_query["to_date"]
 
-        bm25_results = self.es_handler.bm25_search(clean_query, top_k=top_k*2, filters=filters)
+        if not self.bm25 or not self.doc_list:
+            return {"error": "No documents indexed"}
+
+        tokenized_query = clean_query.lower().split()
+        scores = self.bm25.get_scores(tokenized_query)
         
-        if not bm25_results and clean_query:
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k*2]
+        
+        filtered_results = []
+        for idx in top_indices:
+            if idx < len(self.doc_list):
+                doc = self.doc_list[idx]
+                
+                if filters.get("source") and doc.source.value != filters["source"]:
+                    continue
+                if filters.get("author") and doc.author.lower() != filters["author"].lower():
+                    continue
+                
+                filtered_results.append((idx, doc, scores[idx]))
+
+        if not filtered_results:
             return {"error": "No results found"}
 
-        query_embedding = self.vector_store.embed_text(clean_query)
-        semantic_results = self.es_handler.semantic_search(query_embedding, top_k=top_k*2, filters=filters)
-
-        merged_results = self._merge_results(bm25_results, semantic_results)
-
-        bm25_scores = [r.get("_score", 0) for r in bm25_results[:len(merged_results)]]
-        semantic_scores = [self._calculate_semantic_score(r, query_embedding) for r in merged_results]
-
-        ranked_results = self.ranker.rank(merged_results, bm25_scores, semantic_scores)
-
         if sort_by == "recent":
-            ranked_results.sort(key=lambda x: x[0].get("published_at", ""), reverse=True)
+            filtered_results.sort(key=lambda x: x[1].published_at, reverse=True)
         elif sort_by == "trending":
             trending = self.get_trending_topics()
-            ranked_results = self.ranker.boost_trending(ranked_results, trending)
+            filtered_results.sort(key=lambda x: (
+                any(tag in trending for tag in x[1].tags),
+                x[2]
+            ), reverse=True)
 
         search_results = []
-        for result, score in ranked_results[:top_k]:
-            snippet = self.snippet_gen.generate(result.get("content", ""), clean_query)
+        for idx, doc, score in filtered_results[:top_k]:
+            snippet = self.snippet_gen.generate(doc.content, clean_query)
             
             search_result = SearchResult(
-                id=result["id"],
-                title=result["title"],
-                excerpt=result["excerpt"],
+                id=doc.id,
+                title=doc.title,
+                excerpt=doc.excerpt,
                 snippet=snippet,
-                url=result["url"],
-                source=result["source"],
-                author=result["author"],
-                published_at=datetime.fromisoformat(result["published_at"]) if isinstance(result["published_at"], str) else result["published_at"],
-                views=result.get("views", 0),
-                likes=result.get("likes", 0),
-                relevance_score=bm25_scores[0] if bm25_scores else 0,
-                semantic_score=semantic_scores[0] if semantic_scores else 0,
-                ranking_score=score,
-                tags=result.get("tags", [])
+                url=doc.url,
+                source=doc.source,
+                author=doc.author,
+                published_at=doc.published_at,
+                views=doc.views,
+                likes=doc.likes,
+                relevance_score=float(score),
+                semantic_score=0.0,
+                ranking_score=float(score),
+                tags=doc.tags
             )
             search_results.append(search_result)
 
@@ -97,54 +106,17 @@ class SearchService:
             "execution_time_ms": execution_time
         }
 
-    def _merge_results(self, bm25_results: list[dict], semantic_results: list[dict]) -> list[dict]:
-        seen_ids = set()
-        merged = []
-
-        for result in bm25_results:
-            if result["id"] not in seen_ids:
-                seen_ids.add(result["id"])
-                merged.append(result)
-
-        for result in semantic_results:
-            if result["id"] not in seen_ids:
-                seen_ids.add(result["id"])
-                merged.append(result)
-
-        return merged
-
-    def _calculate_semantic_score(self, result: dict, query_embedding: list[float]) -> float:
-        result_embedding = result.get("embedding", [])
-        if not result_embedding:
-            return 0.5
-
-        import numpy as np
-        dot_product = np.dot(query_embedding, result_embedding)
-        return float(dot_product)
-
     def get_trending_topics(self, days: int = 7) -> list[str]:
-        try:
-            agg_query = {
-                "query": {
-                    "range": {
-                        "published_at": {
-                            "gte": f"now-{days}d"
-                        }
-                    }
-                },
-                "aggs": {
-                    "trending_tags": {
-                        "terms": {"field": "tags", "size": 10}
-                    }
-                },
-                "size": 0
-            }
-
-            results = self.es_handler.client.search(index=self.es_handler.index_name, body=agg_query)
-            return [bucket["key"] for bucket in results["aggregations"]["trending_tags"]["buckets"]]
-        except Exception as e:
-            print(f"Error getting trending topics: {e}")
+        if not self.doc_list:
             return []
+        
+        tag_counts = {}
+        for doc in self.doc_list:
+            for tag in doc.tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        
+        sorted_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+        return [tag for tag, count in sorted_tags[:10]]
 
     def crawl_and_index_fresh(self, limit_per_source: int = 20):
         articles = self.crawler.fetch_all_sources(limit_per_source=limit_per_source)
