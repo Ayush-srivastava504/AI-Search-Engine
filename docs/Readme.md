@@ -157,27 +157,27 @@ The system can be tested locally using Docker Compose. All services (Elasticsear
 
 The Elasticsearch service runs on port 9200 and stores indexed articles. Status can be verified using docker commands to confirm the service is running and healthy.
 
-![Elasticsearch Service Running](docs/screenshots/Screenshot_elasticsearch.png)
+![Elasticsearch Service Running](image/Screenshot_elasticsearch.png)
 
 #### API Documentation
 
 The FastAPI backend automatically generates interactive OpenAPI documentation accessible at `/docs`. This provides a complete interface to test all endpoints including search, trending, and crawl operations.
 
-![API Documentation Interface](docs/screenshots/Screenshot_api_docs.png)
+![API Documentation Interface](image/Screenshot_api_docs.png)
 
 #### Search Results
 
 The React frontend displays search results with article metadata, relevance scores, and engagement metrics. Results can be sorted by relevance, recency, or trending status. Each article card shows the source (Hacker News, Dev.to, Medium), author information, publication date, and engagement metrics.
 
-![Search Results Interface](docs/screenshots/search_results.png)
+![Search Results Interface](image/search_results.png)
 
-![Detailed Search Results](docs/screenshots/Screenshot_search_results2.png)
+![Detailed Search Results](image/Screenshot_search_results2.png)
 
 #### Data Initialization
 
 Running the initialization script crawls articles from all configured sources and indexes them into Elasticsearch. The system reports the number of unique articles collected and successfully indexed.
 
-![Docker Container Status](docs/screenshots/Screenshot_docker.png)
+![Docker Container Status](image/Screenshot_docker.png)
 
 ## Deployment
 
